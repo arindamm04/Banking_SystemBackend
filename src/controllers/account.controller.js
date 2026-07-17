@@ -186,4 +186,485 @@ const getMyAccounts = asyncHandler(async (req, res) => {
 
 });
 
-export {createAccount, getMyAccounts}
+//getAccount by id
+
+const getAccountById = asyncHandler(async (req, res) => {
+
+    // Get account ID from request parameters
+    const { accountId } = req.params;
+
+    // Validate MongoDB ObjectId
+    if (!mongoose.isValidObjectId(accountId)) {
+        throw new ApiError(400, "Invalid Account ID");
+    }
+
+    // Find account and ensure it belongs to the logged-in user
+    const account = await Account.findOne({
+        _id: accountId,
+        user: req.user._id
+    })
+        // Return only required fields
+        .select(
+            "accountNumber accountType balance currency status isKycVerified openedAt createdAt updatedAt branch"
+        )
+
+        // Populate required branch details
+        .populate({
+            path: "branch",
+            select: "branchName branchCode ifscCode city state"
+        })
+
+        // Return plain JavaScript object
+        .lean();
+
+    // Account not found OR doesn't belong to logged-in user
+    if (!account) {
+        throw new ApiError(
+            404,
+            "Account not found or access denied"
+        );
+    }
+
+    // Success response
+    return res.status(200).json(
+        new ApiResponse(
+            200,
+            account,
+            "Account fetched successfully"
+        )
+    );
+
+});
+
+const updateAccount = asyncHandler(async (req, res) => {
+
+    // Start MongoDB Session
+    const session = await mongoose.startSession();
+
+    try {
+
+        // Start Transaction
+        session.startTransaction();
+
+        // Get Account ID
+        const { accountId } = req.params;
+
+        // Validate MongoDB ObjectId
+        if (!mongoose.isValidObjectId(accountId)) {
+            throw new ApiError(400, "Invalid Account ID");
+        }
+
+        // Extract Allowed Fields
+        const {
+            nickname,
+            isPrimary
+        } = req.body;
+
+        // Ensure at least one field is provided
+        if (nickname === undefined && isPrimary === undefined) {
+            throw new ApiError(
+                400,
+                "Please provide at least one field to update."
+            );
+        }
+
+        // Find account and verify ownership
+        const account = await Account.findOne({
+            _id: accountId,
+            user: req.user._id,
+            status: { $ne: "Closed" }
+        }).session(session);
+
+        if (!account) {
+            throw new ApiError(
+                404,
+                "Account not found or access denied."
+            );
+        }
+
+        // ----------------------------
+        // Update Nickname
+        // ----------------------------
+        if (nickname !== undefined) {
+
+            if (typeof nickname !== "string") {
+                throw new ApiError(
+                    400,
+                    "Nickname must be a string."
+                );
+            }
+
+            const trimmedNickname = nickname.trim();
+
+            if (trimmedNickname.length === 0) {
+                throw new ApiError(
+                    400,
+                    "Nickname cannot be empty."
+                );
+            }
+
+            if (trimmedNickname.length > 50) {
+                throw new ApiError(
+                    400,
+                    "Nickname cannot exceed 50 characters."
+                );
+            }
+
+            account.nickname = trimmedNickname;
+        }
+
+        // ----------------------------
+        // Update Primary Account
+        // ----------------------------
+        if (isPrimary !== undefined) {
+
+            if (typeof isPrimary !== "boolean") {
+                throw new ApiError(
+                    400,
+                    "isPrimary must be a boolean."
+                );
+            }
+
+            if (isPrimary) {
+
+                // Remove primary flag from all other accounts
+                await Account.updateMany(
+                    {
+                        user: req.user._id,
+                        _id: { $ne: account._id }
+                    },
+                    {
+                        $set: {
+                            isPrimary: false
+                        }
+                    },
+                    {
+                        session
+                    }
+                );
+            }
+
+            account.isPrimary = isPrimary;
+        }
+
+        // Save updated account
+        await account.save({ session });
+
+        // Commit Transaction
+        await session.commitTransaction();
+
+        // Fetch updated account
+        const updatedAccount = await Account.findById(account._id)
+            .populate({
+                path: "branch",
+                select: "branchName branchCode ifscCode city state"
+            })
+            .select("-__v")
+            .lean();
+
+        return res.status(200).json(
+            new ApiResponse(
+                200,
+                updatedAccount,
+                "Account updated successfully."
+            )
+        );
+
+    } catch (error) {
+
+        // Rollback if anything fails
+        await session.abortTransaction();
+        throw error;
+
+    } finally {
+
+        // Always close session
+        session.endSession();
+    }
+
+});
+
+const freezeAccount = asyncHandler(async (req, res) => {
+
+    // Start MongoDB Session
+    const session = await mongoose.startSession();
+
+    try {
+
+        // Start Transaction
+        session.startTransaction();
+
+        // Get Account ID
+        const { accountId } = req.params;
+
+        // Validate MongoDB ObjectId
+        if (!mongoose.isValidObjectId(accountId)) {
+            throw new ApiError(400, "Invalid Account ID");
+        }
+
+        // Find Account & Verify Ownership
+        const account = await Account.findOne({
+            _id: accountId,
+            user: req.user._id
+        }).session(session);
+
+        if (!account) {
+            throw new ApiError(
+                404,
+                "Account not found or access denied."
+            );
+        }
+
+        // Closed account cannot be frozen
+        if (account.status === "Closed") {
+            throw new ApiError(
+                400,
+                "Closed account cannot be frozen."
+            );
+        }
+
+        // Already Frozen
+        if (account.status === "Frozen") {
+            throw new ApiError(
+                400,
+                "Account is already frozen."
+            );
+        }
+
+        // Freeze Account
+        account.status = "Frozen";
+
+        // Save Changes
+        await account.save({ session });
+
+        // Commit Transaction
+        await session.commitTransaction();
+
+        // Fetch Updated Account
+        const updatedAccount = await Account.findById(account._id)
+        .populate({
+            path: "branch",
+            select: "branchName branchCode ifscCode city state"
+        })
+        .select("-__v")
+        .lean();
+
+        // Return Updated Account
+
+
+        return res.status(200).json(
+
+            new ApiResponse(
+                200,
+                updatedAccount,
+                "Account frozen successfully."
+            )
+
+        );
+
+    } catch (error) {
+
+        // Rollback Transaction
+        await session.abortTransaction();
+
+        throw error;
+
+    } finally {
+
+        // Close MongoDB Session
+        session.endSession();
+    }
+
+});
+
+const unfreezeAccount = asyncHandler(async (req, res) => {
+
+    const session = await mongoose.startSession();
+
+    try {
+
+        session.startTransaction();
+
+        const { accountId } = req.params;
+
+        if (!mongoose.isValidObjectId(accountId)) {
+            throw new ApiError(400, "Invalid Account ID");
+        }
+
+        const account = await Account.findOne({
+            _id: accountId,
+            user: req.user._id
+        }).session(session);
+
+        if (!account) {
+            throw new ApiError(
+                404,
+                "Account not found or access denied."
+            );
+        }
+
+        if (account.status === "Closed") {
+            throw new ApiError(
+                400,
+                "Closed account cannot be reactivated."
+            );
+        }
+
+        if (account.status === "Active") {
+            throw new ApiError(
+                400,
+                "Account is already active."
+            );
+        }
+
+        account.status = "Active";
+
+        await account.save({ session });
+
+        await session.commitTransaction();
+
+        const updatedAccount = await Account.findById(account._id)
+            .populate({
+                path: "branch",
+                select: "branchName branchCode ifscCode city state"
+            })
+            .select("-__v")
+            .lean();
+
+        return res.status(200).json(
+            new ApiResponse(
+                200,
+                updatedAccount,
+                "Account activated successfully."
+            )
+        );
+
+    } catch (error) {
+
+        await session.abortTransaction();
+        throw error;
+
+    } finally {
+
+        session.endSession();
+    }
+
+});
+
+const closeAccount = asyncHandler(async (req, res) => {
+
+    const session = await mongoose.startSession();
+
+    try {
+
+        session.startTransaction();
+
+        const { accountId } = req.params;
+
+        if (!mongoose.isValidObjectId(accountId)) {
+            throw new ApiError(400, "Invalid Account ID");
+        }
+
+        const account = await Account.findOne({
+            _id: accountId,
+            user: req.user._id
+        }).session(session);
+
+        if (!account) {
+            throw new ApiError(
+                404,
+                "Account not found or access denied."
+            );
+        }
+
+        if (account.status === "Closed") {
+            throw new ApiError(
+                400,
+                "Account is already closed."
+            );
+        }
+
+        if (account.balance > 0) {
+            throw new ApiError(
+                400,
+                "Account balance must be zero before closing."
+            );
+        }
+
+        account.status = "Closed";
+
+        await account.save({ session });
+
+        await session.commitTransaction();
+
+        const updatedAccount = await Account.findById(account._id)
+            .populate({
+                path: "branch",
+                select: "branchName branchCode ifscCode city state"
+            })
+            .select("-__v")
+            .lean();
+
+        return res.status(200).json(
+            new ApiResponse(
+                200,
+                updatedAccount,
+                "Account closed successfully."
+            )
+        );
+
+    } catch (error) {
+
+        await session.abortTransaction();
+        throw error;
+
+    } finally {
+
+        session.endSession();
+    }
+
+});
+
+const getAccountBalance = asyncHandler(async (req, res) => {
+
+    const { accountId } = req.params;
+
+    if (!mongoose.isValidObjectId(accountId)) {
+        throw new ApiError(400, "Invalid Account ID");
+    }
+
+    const account = await Account.findOne({
+        _id: accountId,
+        user: req.user._id
+    })
+        .select("accountNumber balance currency status")
+        .lean();
+
+    if (!account) {
+        throw new ApiError(
+            404,
+            "Account not found or access denied."
+        );
+    }
+
+    return res.status(200).json(
+        new ApiResponse(
+            200,
+            account,
+            "Account balance fetched successfully."
+        )
+    );
+
+});
+
+
+
+export {createAccount, 
+    getMyAccounts, 
+    getAccountById, 
+    updateAccount, 
+    freezeAccount, 
+    unfreezeAccount, 
+    closeAccount, 
+    getAccountBalance}
+

@@ -42,6 +42,29 @@ const accountSchema = new mongoose.Schema(
             ref: "Branch",
             required: true,
         },
+        nickname: {
+            type: String,
+            trim: true,
+            maxlength: 50,
+            default: ""
+        },
+
+        isPrimary: {
+            type: Boolean,
+            default: false
+        },
+
+        isKycVerified: {
+            type: Boolean,
+            default: false
+        },
+        openedAt: {
+            type: Date,
+            default: Date.now
+
+        },
+        
+    
     },
     {
         timestamps: true,

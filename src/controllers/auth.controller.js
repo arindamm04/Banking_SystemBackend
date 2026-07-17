@@ -1,8 +1,17 @@
 import jwt from "jsonwebtoken"
+import bcrypt from "bcrypt";
 import {User} from "../models/user.models.js";
+import { Otp } from "../models/otp.model.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
+import { generateOTP } from "../utils/generateOTP.js";
+import { sendEmail } from "../services/email.service.js";
+import {
+    OTP_EXPIRY_MINUTES,
+    OTP_MAX_ATTEMPTS,
+    OTP_RESEND_COOLDOWN_SECONDS,
+} from "../constants.js";
 
 /**
  * Generate Access & Refresh Tokens
@@ -200,7 +209,8 @@ const logoutUser = asyncHandler(async (req, res) => {
 
     const options = {
         httpOnly: true,
-        secure: true
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "strict",
     };
 
     return res
@@ -361,13 +371,145 @@ const changeCurrentPassword = asyncHandler(async (req, res) => {
 
 });
 
+/**
+ * Send Email Verification OTP
+ */
+const sendVerificationOtp = asyncHandler(async (req, res) => {
+
+    const { email } = req.body;
+
+    if (!email) {
+        throw new ApiError(400, "Email is required");
+    }
+
+    const user = await User.findOne({ email });
+
+    if (!user) {
+        throw new ApiError(404, "User does not exist");
+    }
+
+    if (user.isVerified) {
+        throw new ApiError(409, "Email already verified");
+    }
+
+    const cooldownStart = new Date(
+        Date.now() - OTP_RESEND_COOLDOWN_SECONDS * 1000
+    );
+
+    const recentOtp = await Otp.findOne({
+        user: user._id,
+        purpose: "email-verification",
+        isUsed: false,
+        createdAt: { $gte: cooldownStart },
+    });
+
+    if (recentOtp) {
+        throw new ApiError(
+            429,
+            `Please wait before requesting another OTP`
+        );
+    }
+
+    // Invalidate any previously issued, unused OTPs
+    await Otp.deleteMany({
+        user: user._id,
+        purpose: "email-verification",
+        isUsed: false,
+    });
+
+    const otp = generateOTP(6);
+    const otpHash = await bcrypt.hash(otp, 10);
+
+    await Otp.create({
+        user: user._id,
+        email: user.email,
+        otpHash,
+        purpose: "email-verification",
+        expiresAt: new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000),
+    });
+
+    await sendEmail({
+        to: user.email,
+        subject: "Verify your email",
+        text: `Your verification OTP is ${otp}. It expires in ${OTP_EXPIRY_MINUTES} minutes.`,
+        html: `<p>Your verification OTP is <strong>${otp}</strong>.</p><p>It expires in ${OTP_EXPIRY_MINUTES} minutes.</p>`,
+    });
+
+    return res.status(200).json(
+        new ApiResponse(
+            200,
+            {},
+            "Verification OTP sent successfully"
+        )
+    );
+
+});
+
+/**
+ * Verify Email OTP
+ */
+const verifyOtp = asyncHandler(async (req, res) => {
+
+    const { email, otp } = req.body;
+
+    if (!email || !otp) {
+        throw new ApiError(400, "Email and OTP are required");
+    }
+
+    const otpDoc = await Otp.findOne({
+        email,
+        purpose: "email-verification",
+        isUsed: false,
+    }).sort({ createdAt: -1 });
+
+    if (!otpDoc) {
+        throw new ApiError(400, "No pending OTP request found for this email");
+    }
+
+    if (otpDoc.expiresAt < new Date()) {
+        throw new ApiError(400, "OTP has expired, please request a new one");
+    }
+
+    const isOtpValid = await bcrypt.compare(otp, otpDoc.otpHash);
+
+    if (!isOtpValid) {
+
+        otpDoc.attempts += 1;
+
+        if (otpDoc.attempts >= OTP_MAX_ATTEMPTS) {
+            otpDoc.isUsed = true;
+            await otpDoc.save();
+            throw new ApiError(429, "Too many incorrect attempts, please request a new OTP");
+        }
+
+        await otpDoc.save();
+        throw new ApiError(400, "Invalid OTP");
+    }
+
+    otpDoc.isUsed = true;
+    await otpDoc.save();
+
+    await User.findByIdAndUpdate(otpDoc.user, { isVerified: true });
+
+    return res.status(200).json(
+        new ApiResponse(
+            200,
+            {},
+            "Email verified successfully"
+        )
+    );
+
+});
+
 export {
     registerUser,
     loginUser,
     generateAccessAndRefreshTokens,
     logoutUser,
-    refreshAccessToken, 
-    getCurrentUser, 
-    changeCurrentPassword
+    refreshAccessToken,
+    getCurrentUser,
+    changeCurrentPassword,
+    sendVerificationOtp,
+    verifyOtp,
 };
 
